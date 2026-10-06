@@ -75,7 +75,7 @@ sologsb101-1014/
         ├── hooks/              # useSurvivalRate.ts useIdbTable.ts
         ├── pages/              # 5 个模块页面
         ├── router/index.tsx    # 路由表 + ROUTES 常量
-        └── utils/              # rate.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # rate.ts loss.ts db.ts export.ts seed.ts id.ts
 ```
 
 ---
@@ -85,8 +85,8 @@ sologsb101-1014/
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
 | `/plots` | `pages/PlotList.tsx` | 修复地块台账：新建/编辑/级联删除、按潮位带与底质筛选、回显栽植总株数与最新成活率 |
-| `/plots/:id/seedlings` | `pages/SeedlingBoard.tsx` | 苗木批次与来源登记、批次数量累计校验（含密度提示） |
-| `/plots/:id/plantings` | `pages/PlantingEntry.tsx` | 栽植记录：录株距与株数、按面积与株距校验密度合理性 |
+| `/plots/:id/seedlings` | `pages/SeedlingBoard.tsx` | 苗木批次与来源登记、批次数量累计校验（含密度提示）、结存登记（苗圃退苗/到场损耗）与已耗尽标记 |
+| `/plots/:id/plantings` | `pages/PlantingEntry.tsx` | 栽植记录：录株距与株数、按面积与株距校验密度合理性、批次选择自动过滤已耗尽批次 |
 | `/surveys` | `pages/SurveyBoard.tsx` | 成活率与株高验收台：按测次录入、自动算成活率、低于阈值告警、批量调整成活率等级 |
 | `/replants` | `pages/ReplantPlan.tsx` | 补植计划：状态流转（待补植→已补植→已复核）、行内草稿、JSON 导入导出、结构版本查看 |
 
@@ -100,30 +100,33 @@ sologsb101-1014/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbmangrove`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
-  * 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
-  * 回填 `revision` / `createdAt` / `updatedAt`；
-  * 为 `plots` 补齐 `missingCount`、`lastReplantDate` 回写字段；
-  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移，
+  `version(3)` 新增结存登记表：
+  * v2：为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
+    回填 `revision` / `createdAt` / `updatedAt`；为 `plots` 补齐 `missingCount`、`lastReplantDate`；
+    为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+  * v3：新增 `seedlingLosses` 表（苗木结存登记）；为 `seedlings` 补齐 `depleted`（已耗尽）回写位，历史批次默认 `false`。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `plots` | id | name, tideZone, substrate, restoreMode, state, createdAt, updatedAt |
   | `seedlings` | id | plotId, species, source, arrivalDate, quantity |
+  | `seedlingLosses` | id | seedlingId, registerDate |
   | `plantings` | id | plotId, seedlingId, plantDate, spacingM |
   | `surveys` | id | plotId, [plotId+round], date, grade |
   | `replants` | id | plotId, planDate, state, species |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `plots` 表是否为空，为空则调用 `utils/seed.ts` 播种，
-  幂等且只执行一次。播种链路为 **地块 → 苗木批次 → 栽植 → 验收 → 补植** 三层互相引用：
+  幂等且只执行一次。播种链路为 **地块 → 苗木批次 → 结存登记 / 栽植 → 验收 → 补植** 互相引用：
   * 3 个地块（东港南堤 3 号地块 / 西湾滩涂 A 区 / 北屿外滩 B 区），覆盖三种潮位带与三种底质；
-  * 6 个苗木批次（每地块 2 批）、6 条栽植记录（每地块 2 条，引用真实批次 id）；
+  * 6 个苗木批次（每地块 2 批）、2 条结存登记（到场损耗与苗圃退苗各一）、6 条栽植记录（每地块 2 条，引用真实批次 id）；
   * 7 条验收记录（每地块 2–3 个测次，成活率自洽：90.0% → 85.0% → 79.0% 等）；
   * 3 条补植计划（覆盖待补植 / 已补植 / 已复核三种状态）。
   * 固定 id 如 `plot-donggang-3`、`plot-xiwan-a`、`plot-beiyu-b` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的地块 id」这一界面偏好，不存业务数据。
-* 删除地块会**级联清理**其下的苗木批次、栽植记录、验收记录与补植计划（同一 Dexie 事务内完成）。
+* 删除地块会**级联清理**其下的苗木批次、结存登记、栽植记录、验收记录与补植计划（同一 Dexie 事务内完成）；
+  删除苗木批次会级联清理其结存登记与引用它的栽植记录。
 
 ---
 
@@ -150,5 +153,11 @@ npm run preview      # 预览 dist 产物
 * **成活率** = 成活株数 ÷ 该地块栽植总株数 × 100%（`src/utils/rate.ts` 统一口径）。
 * **成活率等级**：≥ 85% 优，70%–85% 良，50%–70% 一般，< 50% 差；低于 50% 视为告警，建议生成补植计划。
 * **密度合理性**：平均单株占地面积需落在 0.6–12 ㎡/株；过密/过疏都会在栽植记录页给出提示。
+* **可用株数口径（总量重算）**：可用株数 = max(0, 进场数量 − 累计损耗株数)，损耗来自结存登记
+  （苗圃退苗 / 到场损耗，`src/utils/loss.ts` 统一口径）。每次结存登记增删、批次进场数量变更后按
+  全部登记重算，结果与登记顺序无关——补登历史日期的损耗只是把累计损耗加大，幂等可重算。
+* **已耗尽**：累计损耗 ≥ 进场数量即可用株数归零，批次自动标记「已耗尽」并回写 `seedlings.depleted`；
+  已耗尽批次不再出现在栽植记录的批次选择中（编辑历史栽植记录时以禁用选项回显原批次），
+  批次与结存登记本身保留；删除结存登记或调大进场数量可解除耗尽。
 * **补植回写**：补植状态推进到「已补植」时，自动扣减地块缺株数、写入最近补植日期，
   并按「原成活株数 + 本次补植株数」重算最新一次验收的成活率。

@@ -67,9 +67,21 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     };
   }
-  const collections: Array<keyof DatabaseSnapshot> = ['plots', 'seedlings', 'plantings', 'surveys', 'replants'];
+  const collections: Array<keyof DatabaseSnapshot> = [
+    'plots',
+    'seedlings',
+    'seedlingLosses',
+    'plantings',
+    'surveys',
+    'replants',
+  ];
   for (const key of collections) {
     if (!Array.isArray(data[key])) {
+      // 兼容 v2 及更早的存档：当时还没有结存登记表，导入时按空表处理
+      if (key === 'seedlingLosses') {
+        (data as DatabaseSnapshot).seedlingLosses = [];
+        continue;
+      }
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }

@@ -1,7 +1,8 @@
 /**
  * /plots/:id/plantings 栽植记录
  * 录入株距与株数并即时提示栽植密度是否异常。
- * 消费模型：Planting、Seedling；复用组件：<FilterBar>、<StatBadge>、<EmptyPanel>
+ * 批次选择只列未耗尽批次（可用株数 = 进场数量 − 累计损耗，归零即耗尽）。
+ * 消费模型：Planting、Seedling、SeedlingLoss；复用组件：<FilterBar>、<StatBadge>、<EmptyPanel>
  */
 import { useMemo, useState } from 'react';
 import {
@@ -32,8 +33,9 @@ import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
 import { db } from '../utils/db';
 import type { Planting } from '../types/planting';
-import type { Seedling } from '../types/seedling';
+import type { Seedling, SeedlingLoss } from '../types/seedling';
 import { ROUTES } from '../router';
+import { availableQuantity } from '../utils/loss';
 import {
   DENSITY_MAX_M2_PER_PLANT,
   DENSITY_MIN_M2_PER_PLANT,
@@ -66,6 +68,7 @@ export default function PlantingEntry() {
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
 
   const seedlingTable = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
+  const lossTable = useIdbTable<SeedlingLoss>(db.seedlingLosses, { sortByUpdatedAt: false });
   const { rows, loading, create, update, remove } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
 
   const [keyword, setKeyword] = useState('');
@@ -80,6 +83,28 @@ export default function PlantingEntry() {
     () => seedlingTable.rows.filter((row) => row.plotId === id),
     [seedlingTable.rows, id],
   );
+
+  /** 可选批次：已耗尽（可用株数归零）的批次不再出现在栽植记录的批次选择中 */
+  const selectableSeedlings = useMemo(() => plotSeedlings.filter((row) => !row.depleted), [plotSeedlings]);
+
+  /** 批次下拉选项：未耗尽批次显示实时可用株数；编辑历史记录时若原批次已耗尽，补一个禁用选项用于回显 */
+  const seedlingOptions = useMemo(() => {
+    const options: Array<{ value: string; label: string; disabled?: boolean }> = selectableSeedlings.map((row) => ({
+      value: row.id,
+      label: `${row.species} · ${row.spec} · 可用 ${availableQuantity(row, lossTable.rows).toLocaleString('zh-CN')} 株（进场 ${row.quantity.toLocaleString('zh-CN')}，${row.source}）`,
+    }));
+    if (editing !== null && !selectableSeedlings.some((row) => row.id === editing.seedlingId)) {
+      const current = plotSeedlings.find((row) => row.id === editing.seedlingId);
+      if (current !== undefined) {
+        options.unshift({
+          value: current.id,
+          label: `${current.species} · ${current.spec} · 已耗尽（仅保留历史记录）`,
+          disabled: true,
+        });
+      }
+    }
+    return options;
+  }, [selectableSeedlings, editing, plotSeedlings, lossTable.rows]);
 
   const plotPlantings = useMemo(
     () => rows.filter((row) => row.plotId === id).sort((a, b) => b.plantDate.localeCompare(a.plantDate)),
@@ -122,7 +147,7 @@ export default function PlantingEntry() {
     setDensity(null);
     form.setFieldsValue({
       ...DEFAULT_VALUES,
-      seedlingId: plotSeedlings.length > 0 ? plotSeedlings[0].id : '',
+      seedlingId: selectableSeedlings.length > 0 ? selectableSeedlings[0].id : '',
       plantDate: dayjs(),
     });
     setOpen(true);
@@ -327,12 +352,25 @@ export default function PlantingEntry() {
             </Button>
           }
         />
+      ) : selectableSeedlings.length === 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message="该地块所有苗木批次均已耗尽"
+          description="全部批次的累计损耗已达到进场数量，可用株数为零。请先到苗木批次页核对结存登记，或登记新的苗木批次。"
+          action={
+            <Button size="small" onClick={() => navigate(ROUTES.seedlings(plot.id))}>
+              去苗木批次页
+            </Button>
+          }
+        />
       ) : null}
 
       <Card
         title="栽植记录"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plotSeedlings.length === 0}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={selectableSeedlings.length === 0}>
             新增栽植记录
           </Button>
         }
@@ -395,13 +433,7 @@ export default function PlantingEntry() {
       >
         <Form form={form} layout="vertical" initialValues={DEFAULT_VALUES} onValuesChange={handleValuesChange}>
           <Form.Item name="seedlingId" label="苗木批次" rules={[{ required: true, message: '请选择苗木批次' }]}>
-            <Select
-              placeholder="选择该地块下的苗木批次"
-              options={plotSeedlings.map((row) => ({
-                value: row.id,
-                label: `${row.species} · ${row.spec} · ${row.quantity} 株（${row.source}）`,
-              }))}
-            />
+            <Select placeholder="选择该地块下的苗木批次（仅列未耗尽批次）" options={seedlingOptions} />
           </Form.Item>
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item name="plantDate" label="栽植日期" style={{ flex: 1 }} rules={[{ required: true }]}>

@@ -7,26 +7,28 @@
  */
 import Dexie, { type Table } from 'dexie';
 import type { Plot } from '../types/plot';
-import type { Seedling } from '../types/seedling';
+import type { Seedling, SeedlingLoss, SeedlingLossDraft } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant, ReplantState } from '../types/replant';
 import { rateLevel } from './rate';
-import { nowIso, today } from './id';
+import { isDepleted } from './loss';
+import { nowIso, today, uuid } from './id';
 import { seedDatabase } from './seed';
 
 /** 数据库名 */
 export const DB_NAME = 'gbmangrove';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class MangroveDatabase extends Dexie {
   plots!: Table<Plot, string>;
   seedlings!: Table<Seedling, string>;
+  seedlingLosses!: Table<SeedlingLoss, string>;
   plantings!: Table<Planting, string>;
   surveys!: Table<Survey, string>;
   replants!: Table<Replant, string>;
@@ -44,7 +46,7 @@ class MangroveDatabase extends Dexie {
     });
 
     // ---------- v2：补齐索引与回写字段，并迁移历史数据 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
         seedlings: 'id, plotId, species, source, arrivalDate, quantity',
@@ -79,6 +81,23 @@ class MangroveDatabase extends Dexie {
           const rate = typeof row.survivalRate === 'number' ? row.survivalRate : 0;
           if (typeof row.grade !== 'string') row.grade = rateLevel(rate);
           if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
+        });
+      });
+
+    // ---------- v3：新增苗木结存登记表，批次补齐「已耗尽」回写位 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
+        seedlings: 'id, plotId, species, source, arrivalDate, quantity',
+        seedlingLosses: 'id, seedlingId, registerDate',
+        plantings: 'id, plotId, seedlingId, plantDate, spacingM',
+        surveys: 'id, plotId, [plotId+round], date, grade',
+        replants: 'id, plotId, planDate, state, species',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 4：苗木批次补齐 depleted 字段（历史批次均无损耗登记，默认未耗尽）
+        await tx.table('seedlings').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.depleted !== 'boolean') row.depleted = false;
         });
       });
   }
@@ -126,9 +145,13 @@ export async function patchPlot(id: string, patch: Partial<Plot>): Promise<void>
   await db.plots.update(id, { ...patch, updatedAt: nowIso() });
 }
 
-/** 删除地块并级联清理其下苗木批次、栽植、验收与补植计划 */
+/** 删除地块并级联清理其下苗木批次、结存登记、栽植、验收与补植计划 */
 export async function removePlot(id: string): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.seedlingLosses, db.plantings, db.surveys, db.replants], async () => {
+    const seedlingIds = await db.seedlings.where('plotId').equals(id).primaryKeys();
+    if (seedlingIds.length > 0) {
+      await db.seedlingLosses.where('seedlingId').anyOf(seedlingIds).delete();
+    }
     await db.seedlings.where('plotId').equals(id).delete();
     await db.plantings.where('plotId').equals(id).delete();
     await db.surveys.where('plotId').equals(id).delete();
@@ -154,10 +177,54 @@ export async function putSeedling(row: Seedling): Promise<void> {
 }
 
 export async function removeSeedling(id: string): Promise<void> {
-  await db.transaction('rw', db.seedlings, db.plantings, async () => {
-    // 该批次已被栽植记录引用时一并清理，避免出现悬空引用
+  await db.transaction('rw', db.seedlings, db.seedlingLosses, db.plantings, async () => {
+    // 该批次已被栽植记录引用时一并清理，避免出现悬空引用；其结存登记同步删除
     await db.plantings.where('seedlingId').equals(id).delete();
+    await db.seedlingLosses.where('seedlingId').equals(id).delete();
     await db.seedlings.delete(id);
+  });
+}
+
+/* ------------------------------ 结存登记 ------------------------------ */
+
+export async function listSeedlingLosses(seedlingId: string): Promise<SeedlingLoss[]> {
+  const rows = await db.seedlingLosses.where('seedlingId').equals(seedlingId).toArray();
+  return rows.sort((a, b) => b.registerDate.localeCompare(a.registerDate));
+}
+
+/**
+ * 按总量口径重算批次可用株数并回写「已耗尽」标记：
+ * 可用株数 = max(0, 进场数量 − 累计损耗株数)，归零即耗尽（见 utils/loss.ts）。
+ * 结存登记增删、批次进场数量变更后均需调用。
+ */
+export async function syncSeedlingDepletion(seedlingId: string): Promise<void> {
+  const seedling = await db.seedlings.get(seedlingId);
+  if (!seedling) return;
+  const losses = await db.seedlingLosses.where('seedlingId').equals(seedlingId).toArray();
+  const depleted = isDepleted(seedling, losses);
+  if (seedling.depleted !== depleted) {
+    await db.seedlings.update(seedlingId, { depleted, updatedAt: nowIso() });
+  }
+}
+
+/** 新增一条结存登记，并在同一事务内回写批次耗尽状态 */
+export async function addSeedlingLoss(draft: SeedlingLossDraft): Promise<SeedlingLoss> {
+  const stamp = nowIso();
+  const row: SeedlingLoss = { ...draft, id: uuid('loss'), createdAt: stamp, updatedAt: stamp, revision: ROW_REVISION };
+  await db.transaction('rw', db.seedlingLosses, db.seedlings, async () => {
+    await db.seedlingLosses.put(row);
+    await syncSeedlingDepletion(draft.seedlingId);
+  });
+  return row;
+}
+
+/** 删除一条结存登记，并在同一事务内回写批次耗尽状态（损耗减少可解除耗尽） */
+export async function removeSeedlingLoss(id: string): Promise<void> {
+  await db.transaction('rw', db.seedlingLosses, db.seedlings, async () => {
+    const row = await db.seedlingLosses.get(id);
+    if (!row) return;
+    await db.seedlingLosses.delete(id);
+    await syncSeedlingDepletion(row.seedlingId);
   });
 }
 
@@ -284,6 +351,7 @@ export interface DatabaseSnapshot {
   exportedAt: string;
   plots: Plot[];
   seedlings: Seedling[];
+  seedlingLosses: SeedlingLoss[];
   plantings: Planting[];
   surveys: Survey[];
   replants: Replant[];
@@ -291,9 +359,10 @@ export interface DatabaseSnapshot {
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, seedlingLosses, plantings, surveys, replants] = await Promise.all([
     db.plots.toArray(),
     db.seedlings.toArray(),
+    db.seedlingLosses.toArray(),
     db.plantings.toArray(),
     db.surveys.toArray(),
     db.replants.toArray(),
@@ -304,6 +373,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     exportedAt: nowIso(),
     plots,
     seedlings,
+    seedlingLosses,
     plantings,
     surveys,
     replants,
@@ -312,16 +382,21 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 
 /** 用快照覆盖整库（导入存档） */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.seedlingLosses, db.plantings, db.surveys, db.replants], async () => {
     await Promise.all([
       db.plots.clear(),
       db.seedlings.clear(),
+      db.seedlingLosses.clear(),
       db.plantings.clear(),
       db.surveys.clear(),
       db.replants.clear(),
     ]);
     await db.plots.bulkPut(snapshot.plots.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.seedlings.bulkPut(snapshot.seedlings.map((row) => ({ ...row, revision: ROW_REVISION })));
+    // 兼容 v2 及更早的存档：批次可能缺少 depleted 字段
+    await db.seedlings.bulkPut(
+      snapshot.seedlings.map((row) => ({ ...row, depleted: row.depleted ?? false, revision: ROW_REVISION })),
+    );
+    await db.seedlingLosses.bulkPut(snapshot.seedlingLosses.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.plantings.bulkPut(snapshot.plantings.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
@@ -330,10 +405,11 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.seedlingLosses, db.plantings, db.surveys, db.replants], async () => {
     await Promise.all([
       db.plots.clear(),
       db.seedlings.clear(),
+      db.seedlingLosses.clear(),
       db.plantings.clear(),
       db.surveys.clear(),
       db.replants.clear(),
@@ -344,12 +420,13 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, seedlingLosses, plantings, surveys, replants] = await Promise.all([
     db.plots.count(),
     db.seedlings.count(),
+    db.seedlingLosses.count(),
     db.plantings.count(),
     db.surveys.count(),
     db.replants.count(),
   ]);
-  return { plots, seedlings, plantings, surveys, replants };
+  return { plots, seedlings, seedlingLosses, plantings, surveys, replants };
 }

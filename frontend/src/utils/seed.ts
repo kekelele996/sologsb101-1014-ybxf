@@ -1,11 +1,11 @@
 /**
  * 演示数据播种（幂等）
- * 父 → 子 → 孙三层链路：地块 → 苗木批次 / 栽植 → 验收 → 补植
+ * 父 → 子 → 孙三层链路：地块 → 苗木批次 / 栽植 → 验收 → 补植，批次下再挂结存登记
  * 所有 id 固定，保证 /plots/:id/seedlings、/plots/:id/plantings 深链一定命中真实数据。
  */
 import { db, ROW_REVISION } from './db';
 import type { Plot } from '../types/plot';
-import type { Seedling } from '../types/seedling';
+import type { Seedling, SeedlingLoss } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant } from '../types/replant';
@@ -24,7 +24,12 @@ function plotRow(row: Omit<Plot, 'createdAt' | 'updatedAt' | 'revision'>): Plot 
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
-function seedlingRow(row: Omit<Seedling, 'createdAt' | 'updatedAt' | 'revision'>): Seedling {
+function seedlingRow(row: Omit<Seedling, 'createdAt' | 'updatedAt' | 'revision' | 'depleted'>): Seedling {
+  // 播种的损耗登记均不触发耗尽，批次统一初始化为未耗尽
+  return { ...row, depleted: false, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+}
+
+function seedlingLossRow(row: Omit<SeedlingLoss, 'createdAt' | 'updatedAt' | 'revision'>): SeedlingLoss {
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
@@ -104,6 +109,12 @@ export async function seedDatabase(): Promise<void> {
     seedlingRow({ id: 'seedling-c2', plotId: SEED_IDS.plotC, species: '白骨壤', source: '自育苗', spec: '45cm 裸根苗', quantity: 3900, arrivalDate: '2024-03-16' }),
   ];
 
+  // ---------------- 结存登记（2 条：到场损耗与苗圃退苗各一，均不触发耗尽） ----------------
+  const seedlingLosses: SeedlingLoss[] = [
+    seedlingLossRow({ id: 'loss-a2-1', seedlingId: 'seedling-a2', kind: '到场损耗', lossCount: 200, registerDate: '2024-04-11' }),
+    seedlingLossRow({ id: 'loss-b1-1', seedlingId: 'seedling-b1', kind: '苗圃退苗', lossCount: 100, registerDate: '2024-05-01' }),
+  ];
+
   // ---------------- 栽植记录（每地块 2 条，引用真实苗木批次） ----------------
   const plantings: Planting[] = [
     plantingRow({ id: 'planting-a1', plotId: SEED_IDS.plotA, seedlingId: 'seedling-a1', plantDate: '2024-04-12', spacingM: 1, count: 3000, operator: '东港一班' }),
@@ -139,9 +150,10 @@ export async function seedDatabase(): Promise<void> {
     replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
   ];
 
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.seedlingLosses, db.plantings, db.surveys, db.replants], async () => {
     await db.plots.bulkPut(plots);
     await db.seedlings.bulkPut(seedlings);
+    await db.seedlingLosses.bulkPut(seedlingLosses);
     await db.plantings.bulkPut(plantings);
     await db.surveys.bulkPut(surveys);
     await db.replants.bulkPut(replants);

@@ -26,6 +26,11 @@ export interface Seedling {
   quantity: number;
   /** 进场日期 YYYY-MM-DD */
   arrivalDate: string;
+  /**
+   * 是否已耗尽：可用株数（进场数量 − 累计损耗）归零时由结存登记回写。
+   * 已耗尽批次不再出现在栽植记录的批次选择中，但批次与结存登记保留。
+   */
+  depleted: boolean;
   createdAt: string;
   updatedAt: string;
   revision: number;
@@ -39,4 +44,37 @@ export interface SeedlingDraft {
   spec: string;
   quantity: number;
   arrivalDate: string;
+}
+
+/** 损耗类型：苗圃退苗 / 到场损耗 */
+export type SeedlingLossKind = '苗圃退苗' | '到场损耗';
+
+export const SEEDLING_LOSS_KIND_OPTIONS: SeedlingLossKind[] = ['苗圃退苗', '到场损耗'];
+
+/**
+ * 苗木结存登记（SeedlingLoss）
+ * 登记某一批次的损耗株数与登记日期，一条批次可登记多次；
+ * 可用株数按「进场数量 − 累计损耗」总量口径重算（见 utils/loss.ts）。
+ */
+export interface SeedlingLoss {
+  id: string;
+  /** 所属苗木批次 */
+  seedlingId: string;
+  /** 损耗类型 */
+  kind: SeedlingLossKind;
+  /** 损耗株数 */
+  lossCount: number;
+  /** 登记日期 YYYY-MM-DD（允许补登历史日期） */
+  registerDate: string;
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
+}
+
+/** 新建结存登记的表单草稿 */
+export interface SeedlingLossDraft {
+  seedlingId: string;
+  kind: SeedlingLossKind;
+  lossCount: number;
+  registerDate: string;
 }
