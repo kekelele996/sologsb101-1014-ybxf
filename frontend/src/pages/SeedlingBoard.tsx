@@ -22,7 +22,7 @@ import {
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { ArrowLeftOutlined, DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, DeleteOutlined, EditOutlined, PlusOutlined, ProfileOutlined } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
 import { useNavigate, useParams } from 'react-router-dom';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -37,6 +37,8 @@ import {
   type SeedlingSource,
   type SeedlingSpecies,
 } from '../types/seedling';
+import type { SeedlingBalance } from '../types/seedlingBalance';
+import { availableQuantity, isDepleted, sumLosses } from '../utils/seedlingBalance';
 import { ROUTES } from '../router';
 import { muToM2, round1 } from '../utils/rate';
 
@@ -59,18 +61,32 @@ export default function SeedlingBoard() {
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
   const plantings = usePlotStore((state) => state.plantings);
   const { rows, loading, create, update, remove } = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
+  const balanceTable = useIdbTable<SeedlingBalance>(db.seedlingBalances, { sortByUpdatedAt: false });
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Seedling | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<SeedlingFormValues>();
 
+  // 结存登记弹窗：当前登记的批次与表单
+  const [balanceSeedling, setBalanceSeedling] = useState<Seedling | null>(null);
+  const [balanceSubmitting, setBalanceSubmitting] = useState(false);
+  const [balanceForm] = Form.useForm<{ lossCount: number; date: Dayjs }>();
+  const balanceLossCount = Form.useWatch('lossCount', balanceForm);
+
   const plotSeedlings = useMemo(
     () => rows.filter((row) => row.plotId === id).sort((a, b) => b.arrivalDate.localeCompare(a.arrivalDate)),
     [rows, id],
   );
 
+  const plotBalances = useMemo(
+    () => balanceTable.rows.filter((row) => row.plotId === id),
+    [balanceTable.rows, id],
+  );
+
   const totalQuantity = plotSeedlings.reduce((acc, row) => acc + row.quantity, 0);
+  const totalLoss = plotSeedlings.reduce((acc, row) => acc + sumLosses(plotBalances, row.id), 0);
+  const totalAvailable = plotSeedlings.reduce((acc, row) => acc + availableQuantity(row, plotBalances), 0);
   const usedQuantity = plantings
     .filter((row) => row.plotId === id)
     .reduce((acc, row) => acc + row.count, 0);
@@ -138,6 +154,36 @@ export default function SeedlingBoard() {
     );
   };
 
+  const openBalance = (row: Seedling): void => {
+    setBalanceSeedling(row);
+    balanceForm.setFieldsValue({ lossCount: undefined, date: dayjs() });
+  };
+
+  const handleBalanceSubmit = async (): Promise<void> => {
+    if (id === undefined || balanceSeedling === null) return;
+    try {
+      const values = await balanceForm.validateFields();
+      setBalanceSubmitting(true);
+      await balanceTable.create({
+        seedlingId: balanceSeedling.id,
+        plotId: id,
+        lossCount: values.lossCount,
+        date: values.date.format('YYYY-MM-DD'),
+      });
+      message.success(`已登记损耗 ${values.lossCount.toLocaleString('zh-CN')} 株`);
+      balanceForm.setFieldsValue({ lossCount: undefined, date: dayjs() });
+    } catch (error) {
+      if (error instanceof Error) message.error(error.message);
+    } finally {
+      setBalanceSubmitting(false);
+    }
+  };
+
+  const handleDeleteBalance = async (row: SeedlingBalance): Promise<void> => {
+    await balanceTable.remove(row.id);
+    message.success('结存登记已删除，可用株数已重算');
+  };
+
   if (!ready) {
     return <Card loading title="苗木批次与来源登记" />;
   }
@@ -195,6 +241,36 @@ export default function SeedlingBoard() {
           .toLocaleString('zh-CN'),
     },
     {
+      title: '累计损耗（株）',
+      key: 'loss',
+      width: 120,
+      align: 'right',
+      sorter: (a, b) => sumLosses(plotBalances, a.id) - sumLosses(plotBalances, b.id),
+      render: (_value, record) => sumLosses(plotBalances, record.id).toLocaleString('zh-CN'),
+    },
+    {
+      title: '结存可用（株）',
+      key: 'available',
+      width: 130,
+      align: 'right',
+      sorter: (a, b) => availableQuantity(a, plotBalances) - availableQuantity(b, plotBalances),
+      render: (_value, record) => {
+        const available = availableQuantity(record, plotBalances);
+        return (
+          <span style={available === 0 ? { color: '#c0392b', fontWeight: 600 } : undefined}>
+            {available.toLocaleString('zh-CN')}
+          </span>
+        );
+      },
+    },
+    {
+      title: '状态',
+      key: 'status',
+      width: 100,
+      render: (_value, record) =>
+        isDepleted(record, plotBalances) ? <Tag color="red">已耗尽</Tag> : <Tag color="green">正常</Tag>,
+    },
+    {
       title: '进场日期',
       dataIndex: 'arrivalDate',
       key: 'arrivalDate',
@@ -204,15 +280,18 @@ export default function SeedlingBoard() {
     {
       title: '操作',
       key: 'action',
-      width: 170,
+      width: 250,
       render: (_value, record) => (
         <Space size={4}>
+          <Button size="small" type="link" icon={<ProfileOutlined />} onClick={() => openBalance(record)}>
+            结存登记
+          </Button>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
           </Button>
           <Popconfirm
             title="确认删除该苗木批次？"
-            description="引用该批次的栽植记录会被一并清理。"
+            description="引用该批次的栽植记录与结存登记会被一并清理。"
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
@@ -247,6 +326,20 @@ export default function SeedlingBoard() {
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="苗木批次" value={plotSeedlings.length} suffix="批" tone="primary" />
         <StatBadge label="进场苗木合计" value={totalQuantity.toLocaleString('zh-CN')} suffix="株" tone="info" />
+        <StatBadge
+          label="累计损耗"
+          value={totalLoss.toLocaleString('zh-CN')}
+          suffix="株"
+          tone="danger"
+          hint="苗圃退苗与到场损耗合计；可用株数 = 进场数量 − 累计损耗"
+        />
+        <StatBadge
+          label="结存可用"
+          value={totalAvailable.toLocaleString('zh-CN')}
+          suffix="株"
+          tone="success"
+          hint="各批次进场数量扣减累计损耗后的可栽植株数"
+        />
         <StatBadge
           label="已栽植"
           value={usedQuantity.toLocaleString('zh-CN')}
@@ -343,6 +436,134 @@ export default function SeedlingBoard() {
             保存后可在栽植记录页引用该批次，登记株距与株数。
           </Typography.Text>
         </Form>
+      </Modal>
+
+      <Modal
+        title={balanceSeedling === null ? '结存登记' : `结存登记 · ${balanceSeedling.species} ${balanceSeedling.spec}`}
+        open={balanceSeedling !== null}
+        onCancel={() => setBalanceSeedling(null)}
+        onOk={() => void handleBalanceSubmit()}
+        confirmLoading={balanceSubmitting}
+        okText="登记损耗"
+        cancelText="关闭"
+        width={640}
+      >
+        {balanceSeedling !== null ? (
+          <div>
+            <Space size={16} style={{ marginBottom: 12 }} wrap>
+              <Typography.Text>
+                进场 <Typography.Text strong>{balanceSeedling.quantity.toLocaleString('zh-CN')}</Typography.Text> 株
+              </Typography.Text>
+              <Typography.Text type="secondary">
+                累计损耗 {sumLosses(plotBalances, balanceSeedling.id).toLocaleString('zh-CN')} 株
+              </Typography.Text>
+              <Typography.Text>
+                结存可用{' '}
+                <Typography.Text
+                  strong
+                  type={isDepleted(balanceSeedling, plotBalances) ? 'danger' : 'success'}
+                >
+                  {availableQuantity(balanceSeedling, plotBalances).toLocaleString('zh-CN')}
+                </Typography.Text>{' '}
+                株
+              </Typography.Text>
+            </Space>
+
+            {isDepleted(balanceSeedling, plotBalances) ? (
+              <Alert
+                type="error"
+                showIcon
+                style={{ marginBottom: 12 }}
+                message="该批次已耗尽"
+                description="可用株数已归零，不再出现在栽植记录的批次选择中；批次与历史结存登记、栽植记录均保留。"
+              />
+            ) : null}
+
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="结存口径：可用株数 = 进场数量 − 累计损耗"
+              description="每次登记后都按进场数量重新累计，补登更早日期的损耗也会立即参与重算；可用株数归零即标记「已耗尽」，记录保留不删除。"
+            />
+
+            <Form form={balanceForm} layout="vertical">
+              <Space size={12} style={{ display: 'flex' }}>
+                <Form.Item
+                  name="lossCount"
+                  label="损耗株数（株）"
+                  style={{ flex: 1 }}
+                  rules={[{ required: true, message: '请填写损耗株数' }]}
+                >
+                  <InputNumber
+                    min={1}
+                    max={balanceSeedling.quantity}
+                    step={50}
+                    style={{ width: '100%' }}
+                    placeholder="退苗 / 到场损耗数量"
+                  />
+                </Form.Item>
+                <Form.Item
+                  name="date"
+                  label="登记日期"
+                  style={{ flex: 1 }}
+                  rules={[{ required: true, message: '请选择登记日期' }]}
+                >
+                  <DatePicker style={{ width: '100%' }} />
+                </Form.Item>
+              </Space>
+              {balanceLossCount !== undefined &&
+              sumLosses(plotBalances, balanceSeedling.id) + (Number(balanceLossCount) || 0) >
+                balanceSeedling.quantity ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message="累计损耗将超过进场数量"
+                  description="登记后可用株数为 0，该批次将标记为「已耗尽」，不再出现在栽植记录的批次选择中。"
+                />
+              ) : null}
+            </Form>
+
+            <Table<SeedlingBalance>
+              rowKey="id"
+              size="small"
+              pagination={false}
+              dataSource={plotBalances
+                .filter((row) => row.seedlingId === balanceSeedling.id)
+                .sort((a, b) => b.date.localeCompare(a.date))}
+              locale={{ emptyText: '还没有结存登记' }}
+              columns={[
+                { title: '登记日期', dataIndex: 'date', width: 120 },
+                {
+                  title: '损耗株数（株）',
+                  dataIndex: 'lossCount',
+                  align: 'right',
+                  render: (value: number) => value.toLocaleString('zh-CN'),
+                },
+                {
+                  title: '操作',
+                  key: 'action',
+                  width: 80,
+                  render: (_value, record) => (
+                    <Popconfirm
+                      title="确认删除该条结存登记？"
+                      description="删除后可用株数将按进场数量重新计算。"
+                      okText="删除"
+                      okButtonProps={{ danger: true }}
+                      cancelText="取消"
+                      onConfirm={() => void handleDeleteBalance(record)}
+                    >
+                      <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  ),
+                },
+              ]}
+            />
+          </div>
+        ) : null}
       </Modal>
     </div>
   );

@@ -33,6 +33,8 @@ import { usePlotStore } from '../stores/plotStore';
 import { db } from '../utils/db';
 import type { Planting } from '../types/planting';
 import type { Seedling } from '../types/seedling';
+import type { SeedlingBalance } from '../types/seedlingBalance';
+import { availableQuantity, isDepleted } from '../utils/seedlingBalance';
 import { ROUTES } from '../router';
 import {
   DENSITY_MAX_M2_PER_PLANT,
@@ -66,6 +68,7 @@ export default function PlantingEntry() {
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
 
   const seedlingTable = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
+  const balanceTable = useIdbTable<SeedlingBalance>(db.seedlingBalances, { sortByUpdatedAt: false });
   const { rows, loading, create, update, remove } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
 
   const [keyword, setKeyword] = useState('');
@@ -79,6 +82,17 @@ export default function PlantingEntry() {
   const plotSeedlings = useMemo(
     () => seedlingTable.rows.filter((row) => row.plotId === id),
     [seedlingTable.rows, id],
+  );
+
+  const plotBalances = useMemo(
+    () => balanceTable.rows.filter((row) => row.plotId === id),
+    [balanceTable.rows, id],
+  );
+
+  /** 可栽植批次：结存可用株数 > 0（已耗尽批次不再可选，批次与结存记录仍保留） */
+  const selectableSeedlings = useMemo(
+    () => plotSeedlings.filter((row) => !isDepleted(row, plotBalances)),
+    [plotSeedlings, plotBalances],
   );
 
   const plotPlantings = useMemo(
@@ -122,7 +136,7 @@ export default function PlantingEntry() {
     setDensity(null);
     form.setFieldsValue({
       ...DEFAULT_VALUES,
-      seedlingId: plotSeedlings.length > 0 ? plotSeedlings[0].id : '',
+      seedlingId: selectableSeedlings.length > 0 ? selectableSeedlings[0].id : '',
       plantDate: dayjs(),
     });
     setOpen(true);
@@ -211,14 +225,21 @@ export default function PlantingEntry() {
       title: '苗木批次',
       key: 'seedling',
       width: 200,
-      render: (_value, record) => (
-        <Space direction="vertical" size={0}>
-          <span>{seedlingLabel(record.seedlingId)}</span>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            {plotSeedlings.find((item) => item.id === record.seedlingId)?.source ?? '—'}
-          </Typography.Text>
-        </Space>
-      ),
+      render: (_value, record) => {
+        const seedling = plotSeedlings.find((item) => item.id === record.seedlingId);
+        const depleted = seedling !== undefined && isDepleted(seedling, plotBalances);
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{seedlingLabel(record.seedlingId)}</span>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {seedling === undefined
+                ? '—'
+                : `${seedling.source} · 结存 ${availableQuantity(seedling, plotBalances).toLocaleString('zh-CN')} 株`}
+              {depleted ? <Tag color="red" style={{ marginLeft: 6 }}>已耗尽</Tag> : null}
+            </Typography.Text>
+          </Space>
+        );
+      },
     },
     {
       title: '株距（米）',
@@ -314,16 +335,20 @@ export default function PlantingEntry() {
         />
       </div>
 
-      {plotSeedlings.length === 0 ? (
+      {selectableSeedlings.length === 0 ? (
         <Alert
           type="warning"
           showIcon
           style={{ marginBottom: 14 }}
-          message="该地块尚未登记苗木批次"
-          description="栽植记录必须引用一个苗木批次，请先到苗木批次页登记进场苗木。"
+          message={plotSeedlings.length === 0 ? '该地块尚未登记苗木批次' : '该地块苗木批次均已耗尽'}
+          description={
+            plotSeedlings.length === 0
+              ? '栽植记录必须引用一个苗木批次，请先到苗木批次页登记进场苗木。'
+              : '所有批次的可用株数（进场数量 − 累计损耗）均已归零，无法新增栽植记录。可到苗木批次页查看结存登记。'
+          }
           action={
             <Button size="small" onClick={() => navigate(ROUTES.seedlings(plot.id))}>
-              去登记苗木批次
+              {plotSeedlings.length === 0 ? '去登记苗木批次' : '去查看苗木批次'}
             </Button>
           }
         />
@@ -332,7 +357,7 @@ export default function PlantingEntry() {
       <Card
         title="栽植记录"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plotSeedlings.length === 0}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={selectableSeedlings.length === 0}>
             新增栽植记录
           </Button>
         }
@@ -397,10 +422,27 @@ export default function PlantingEntry() {
           <Form.Item name="seedlingId" label="苗木批次" rules={[{ required: true, message: '请选择苗木批次' }]}>
             <Select
               placeholder="选择该地块下的苗木批次"
-              options={plotSeedlings.map((row) => ({
-                value: row.id,
-                label: `${row.species} · ${row.spec} · ${row.quantity} 株（${row.source}）`,
-              }))}
+              options={[
+                ...selectableSeedlings.map((row) => ({
+                  value: row.id,
+                  label: `${row.species} · ${row.spec} · 结存 ${availableQuantity(
+                    row,
+                    plotBalances,
+                  ).toLocaleString('zh-CN')} 株（${row.source}）`,
+                })),
+                // 编辑旧记录时若原批次已耗尽，保留为禁用选项，避免表单值悬空
+                ...(editing !== null && !selectableSeedlings.some((row) => row.id === editing.seedlingId)
+                  ? [
+                      {
+                        value: editing.seedlingId,
+                        disabled: true,
+                        label: `${
+                          plotSeedlings.find((row) => row.id === editing.seedlingId)?.species ?? ''
+                        } · ${plotSeedlings.find((row) => row.id === editing.seedlingId)?.spec ?? ''}（已耗尽，不可选）`,
+                      },
+                    ]
+                  : []),
+              ]}
             />
           </Form.Item>
           <Space size={12} style={{ display: 'flex' }}>

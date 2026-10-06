@@ -73,6 +73,10 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }
+  // seedlingBalances 为 v3 新增集合：旧版存档（v2 及更早）缺该数组时按空集合导入
+  if (data.seedlingBalances !== undefined && !Array.isArray(data.seedlingBalances)) {
+    return { ok: false, message: '存档 seedlingBalances 字段格式不正确。', snapshot: null };
+  }
   return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
 }
 

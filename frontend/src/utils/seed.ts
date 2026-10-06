@@ -6,6 +6,7 @@
 import { db, ROW_REVISION } from './db';
 import type { Plot } from '../types/plot';
 import type { Seedling } from '../types/seedling';
+import type { SeedlingBalance } from '../types/seedlingBalance';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant } from '../types/replant';
@@ -25,6 +26,12 @@ function plotRow(row: Omit<Plot, 'createdAt' | 'updatedAt' | 'revision'>): Plot 
 }
 
 function seedlingRow(row: Omit<Seedling, 'createdAt' | 'updatedAt' | 'revision'>): Seedling {
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+}
+
+function seedlingBalanceRow(
+  row: Omit<SeedlingBalance, 'createdAt' | 'updatedAt' | 'revision'>,
+): SeedlingBalance {
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
@@ -104,6 +111,19 @@ export async function seedDatabase(): Promise<void> {
     seedlingRow({ id: 'seedling-c2', plotId: SEED_IDS.plotC, species: '白骨壤', source: '自育苗', spec: '45cm 裸根苗', quantity: 3900, arrivalDate: '2024-03-16' }),
   ];
 
+  // ---------------- 结存登记（损耗登记，一条批次可登记多次） ----------------
+  const seedlingBalances: SeedlingBalance[] = [
+    // 东港南堤 a1：风暴潮后全批损耗，批次耗尽（栽植记录等历史数据保留）
+    seedlingBalanceRow({ id: 'balance-a1', seedlingId: 'seedling-a1', plotId: SEED_IDS.plotA, lossCount: 3200, date: '2024-05-10' }),
+    // 东港南堤 a2：分批登记退苗与损耗
+    seedlingBalanceRow({ id: 'balance-a2-1', seedlingId: 'seedling-a2', plotId: SEED_IDS.plotA, lossCount: 150, date: '2024-04-20' }),
+    seedlingBalanceRow({ id: 'balance-a2-2', seedlingId: 'seedling-a2', plotId: SEED_IDS.plotA, lossCount: 50, date: '2024-05-12' }),
+    // 西湾 b1：到场损耗
+    seedlingBalanceRow({ id: 'balance-b1', seedlingId: 'seedling-b1', plotId: SEED_IDS.plotB, lossCount: 100, date: '2024-05-02' }),
+    // 北屿 c2：补登更早日期的损耗（演示补登场景）
+    seedlingBalanceRow({ id: 'balance-c2', seedlingId: 'seedling-c2', plotId: SEED_IDS.plotC, lossCount: 300, date: '2024-03-18' }),
+  ];
+
   // ---------------- 栽植记录（每地块 2 条，引用真实苗木批次） ----------------
   const plantings: Planting[] = [
     plantingRow({ id: 'planting-a1', plotId: SEED_IDS.plotA, seedlingId: 'seedling-a1', plantDate: '2024-04-12', spacingM: 1, count: 3000, operator: '东港一班' }),
@@ -139,9 +159,10 @@ export async function seedDatabase(): Promise<void> {
     replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
   ];
 
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.seedlingBalances, db.plantings, db.surveys, db.replants], async () => {
     await db.plots.bulkPut(plots);
     await db.seedlings.bulkPut(seedlings);
+    await db.seedlingBalances.bulkPut(seedlingBalances);
     await db.plantings.bulkPut(plantings);
     await db.surveys.bulkPut(surveys);
     await db.replants.bulkPut(replants);
